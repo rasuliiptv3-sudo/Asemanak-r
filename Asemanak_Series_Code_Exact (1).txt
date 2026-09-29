@@ -1,0 +1,1349 @@
+# ═══════════════════════════════════════════════════════════════
+# کد کامل بخش سریال‌ها — یکجا برای کپی
+# ═══════════════════════════════════════════════════════════════
+#
+# راهنما: هر بخش با === FILE: مسیر/فایل === شروع می‌شود.
+# محتوای بین خطوط ───── را در فایل مشخص‌شده کپی کنید.
+#
+# ═══════════════════════════════════════════════════════════════
+
+
+=== FILE: base44/entities/Series.jsonc ===
+─────────────────────────────────────────────────────────────────
+{
+  "name": "Series",
+  "type": "object",
+  "properties": {
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "playlistId": { "type": "string" },
+    "playlistUrl": { "type": "string" },
+    "category": {
+      "type": "string",
+      "enum": ["series", "movies", "animation", "comedy", "drama", "occasional"],
+      "default": "series"
+    },
+    "type": { "type": "string", "default": "youtube" },
+    "poster": { "type": "string" },
+    "posterPosition": { "type": "string", "default": "center 20%" },
+    "coverMusic": { "type": "string" },
+    "hideOverlays": { "type": "boolean", "default": false },
+    "sortOrder": { "type": "number", "default": 0 },
+    "episodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "videoId": { "type": "string" },
+          "embedUrl": { "type": "string" },
+          "fileUrl": { "type": "string" },
+          "title": { "type": "string" },
+          "number": { "type": "number" },
+          "season": { "type": "number", "default": 1 }
+        }
+      }
+    }
+  },
+  "required": ["title"],
+  "rls": {
+    "create": { "user_condition": { "role": "admin" } },
+    "read": null,
+    "update": { "user_condition": { "role": "admin" } },
+    "delete": { "user_condition": { "role": "admin" } }
+  }
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: base44/functions/fetchYoutubePlaylist/entry.ts ===
+─────────────────────────────────────────────────────────────────
+import { createClientFromRequest } from 'npm:@base44/sdk@0.8.31';
+
+const API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+const CLIENT_VERSION = '2.20240101.00.00';
+const BROWSE_URL = `https://www.youtube.com/youtubei/v1/browse?key=${API_KEY}`;
+
+const HEADERS = {
+  'Content-Type': 'application/json',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'X-YouTube-Client-Name': '1',
+  'X-YouTube-Client-Version': CLIENT_VERSION,
+  'X-Origin': 'https://www.youtube.com',
+  'Origin': 'https://www.youtube.com',
+  'Referer': 'https://www.youtube.com/',
+};
+
+const CONTEXT = {
+  client: { clientName: 'WEB', clientVersion: CLIENT_VERSION, hl: 'en', gl: 'US' },
+};
+
+function readTitle(data) {
+  try {
+    const header = data?.header?.playlistHeaderRenderer;
+    if (header?.title?.simpleText) return header.title.simpleText;
+    if (header?.title?.runs) return header.title.runs.map(r => r.text).join('');
+  } catch {}
+  return '';
+}
+
+function parsePlaylistData(data) {
+  const episodes = [];
+  let nextToken = null;
+
+  const extractLockup = (lv) => {
+    let videoId = null;
+    let title = '';
+    try {
+      const sources = lv?.contentImage?.thumbnailViewModel?.image?.sources || [];
+      for (const s of sources) {
+        if (s?.url) {
+          const m = s.url.match(/\/(?:vi|vi_webp)\/([a-zA-Z0-9_-]{6,})\//);
+          if (m) { videoId = m[1]; break; }
+        }
+      }
+    } catch {}
+    if (!videoId) {
+      try {
+        const tap = lv?.navigationViewModel?.onTap || {};
+        const we = tap?.innertubeCommand?.watchEndpoint || tap?.watchEndpoint;
+        if (we?.videoId) videoId = we.videoId;
+      } catch {}
+    }
+    if (!videoId) {
+      try {
+        const json = JSON.stringify(lv);
+        const m = json.match(/"videoId":"([a-zA-Z0-9_-]{6,})"/);
+        if (m) videoId = m[1];
+      } catch {}
+    }
+    try { title = lv?.metadata?.lockupMetadataViewModel?.title?.content || ''; } catch {}
+    if (videoId) { episodes.push({ videoId, title }); }
+  };
+
+  const extractVideo = (videoId, title) => {
+    if (!videoId) return;
+    episodes.push({ videoId, title: title || '' });
+  };
+
+  const processItem = (item) => {
+    if (!item || typeof item !== 'object') return;
+    if (item.lockupViewModel) { extractLockup(item.lockupViewModel); }
+    else if (item.playlistVideoRenderer) {
+      const v = item.playlistVideoRenderer;
+      extractVideo(v.videoId, (v.title?.runs || []).map(r => r.text).join(''));
+    } else if (item.playlistPanelVideoRenderer) {
+      const v = item.playlistPanelVideoRenderer;
+      const rawTitle = v.title?.simpleText || (v.title?.runs || []).map(r => r.text).join('');
+      extractVideo(v.videoId, rawTitle);
+    }
+    const tok =
+      item?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token ||
+      item?.continuationItemRenderer?.button?.buttonRenderer?.command?.continuationCommand?.token;
+    if (tok) nextToken = tok;
+  };
+
+  const visit = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) { obj.forEach(visit); return; }
+    if (Array.isArray(obj.continuationItems)) obj.continuationItems.forEach(processItem);
+    if (obj.appendContinuationItemsAction?.continuationItems) obj.appendContinuationItemsAction.continuationItems.forEach(processItem);
+    if (obj.itemSectionRenderer) {
+      const contents = obj.itemSectionRenderer.contents || [];
+      if (contents.some(c => c?.lockupViewModel)) contents.forEach(processItem);
+    }
+    if (obj.playlistVideoListRenderer) {
+      (obj.playlistVideoListRenderer.contents || []).forEach(processItem);
+    }
+    for (const k of Object.keys(obj)) {
+      if (k === 'continuationItems') continue;
+      visit(obj[k]);
+    }
+  };
+  visit(data);
+  return { title: readTitle(data), episodes, nextToken };
+}
+
+Deno.serve(async (req) => {
+  try {
+    const base44 = createClientFromRequest(req);
+    const user = await base44.auth.me();
+    if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+    const body = await req.json().catch(() => ({}));
+    const playlistId = body?.playlistId;
+    if (!playlistId) return Response.json({ error: 'playlistId required' }, { status: 400 });
+
+    const initBody = JSON.stringify({ context: CONTEXT, browseId: `VL${playlistId}` });
+    const initRes = await fetch(BROWSE_URL, { method: 'POST', headers: HEADERS, body: initBody });
+    if (!initRes.ok) return Response.json({ error: `browse failed: ${initRes.status}` }, { status: 502 });
+    const initData = await initRes.json();
+
+    const { title, episodes: initEps, nextToken } = parsePlaylistData(initData);
+    const all = [...initEps];
+    let token = nextToken;
+    let pages = 0;
+
+    while (token && pages < 200) {
+      pages++;
+      let cjson = null;
+      try {
+        const cbody = JSON.stringify({ context: CONTEXT, continuation: token });
+        const cres = await fetch(BROWSE_URL, { method: 'POST', headers: HEADERS, body: cbody });
+        cjson = await cres.json();
+      } catch (e) { break; }
+      const { episodes: cEps, nextToken: ntok } = parsePlaylistData(cjson);
+      all.push(...cEps);
+      token = ntok;
+      if (cEps.length === 0 && !ntok) break;
+    }
+
+    const seen = new Set();
+    const dedup = [];
+    for (const ep of all) {
+      if (!seen.has(ep.videoId)) {
+        seen.add(ep.videoId);
+        dedup.push(ep);
+      }
+    }
+    dedup.forEach((ep, i) => { ep.number = i + 1; });
+
+    return Response.json({ title, episodes: dedup, total: dedup.length });
+  } catch (error) {
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+});
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/brandAssets.js ===
+─────────────────────────────────────────────────────────────────
+export const LOGO_URL = "https://media.base44.com/images/public/69bb192550659e77af7bd3fe/6472c90ea_file_0000000096cc71fd92231a0dad14e023.png";
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/useIsTV.js ===
+─────────────────────────────────────────────────────────────────
+import { useState, useEffect } from "react";
+
+export function checkIsTV() {
+  try { if (document.documentElement.classList.contains('is-tv')) return true; } catch {}
+  try {
+    const flag = localStorage.getItem("ayeneh_force_tv");
+    if (flag === "1") return true;
+    if (flag === "0") return false;
+  } catch {}
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("tv") === "1") return true;
+    if (params.get("tv") === "0") return false;
+  } catch {}
+  const ua = navigator.userAgent || "";
+  if (/tv|smarttv|google ?tv|netcast|baidutv|crkey|smart-tv|googletv|webos|tizen|bravia|firetv|fire-tv|aftt|aftm|aftb|aftd|shield|leanback|onn/i.test(ua)) return true;
+  try {
+    const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    const isAndroid = /android/i.test(ua);
+    if (isAndroid && !hasTouch) return true;
+  } catch {}
+  try {
+    const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    const isCoarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    const sw = (window.screen && window.screen.width) || 0;
+    const sh = (window.screen && window.screen.height) || 0;
+    if (!hasTouch && isCoarse && (sw >= 1280 || sh >= 1280 || window.innerWidth >= 1000 || window.innerHeight >= 1000)) return true;
+  } catch {}
+  try {
+    const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    if (window.innerWidth < 768 && hasTouch) return false;
+  } catch {}
+  return false;
+}
+
+export function setForceTV(val) {
+  try { localStorage.setItem("ayeneh_force_tv", val ? "1" : "0"); } catch {}
+  window.dispatchEvent(new Event("ayeneh-tv-toggle"));
+}
+
+export function useIsTV() {
+  const [isTV, setIsTV] = useState(() => checkIsTV());
+  useEffect(() => {
+    const handler = () => setIsTV(checkIsTV());
+    window.addEventListener("popstate", handler);
+    window.addEventListener("pushstate", handler);
+    window.addEventListener("ayeneh-tv-toggle", handler);
+    window.addEventListener("storage", handler);
+    return () => {
+      window.removeEventListener("popstate", handler);
+      window.removeEventListener("pushstate", handler);
+      window.removeEventListener("ayeneh-tv-toggle", handler);
+      window.removeEventListener("storage", handler);
+    };
+  }, []);
+  return isTV;
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/useIsMobile.js ===
+─────────────────────────────────────────────────────────────────
+import { useState, useEffect } from "react";
+
+export function useIsMobile(breakpoint = 768) {
+  const [mobile, setMobile] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth < breakpoint : false
+  );
+  useEffect(() => {
+    const onResize = () => setMobile(window.innerWidth < breakpoint);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpoint]);
+  return mobile;
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/usePullToRefresh.js ===
+─────────────────────────────────────────────────────────────────
+import { useState, useEffect, useRef } from "react";
+
+export function usePullToRefresh({ onRefresh, disabled, threshold = 70, containerRef }) {
+  const ownRef = useRef(null);
+  const ref = containerRef || ownRef;
+  const [pull, setPull] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const st = useRef({ startY: null, pulling: false, refreshing: false, lastDy: 0 });
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const isMobile = () => window.innerWidth < 768;
+
+    const onStart = (e) => {
+      st.current.startY = e.touches[0].clientY;
+      st.current.lastDy = 0;
+      st.current.pulling = false;
+    };
+    const onMove = (e) => {
+      if (st.current.startY === null || st.current.refreshing) return;
+      const dy = e.touches[0].clientY - st.current.startY;
+      st.current.lastDy = dy;
+      const atTop = el.scrollTop <= 0;
+      if (disabled || !isMobile() || !atTop) {
+        if (st.current.pulling) { st.current.pulling = false; setPull(0); }
+        return;
+      }
+      if (dy <= 0) { st.current.pulling = false; setPull(0); return; }
+      st.current.pulling = true;
+      setPull(Math.min(threshold * 1.6, dy * 0.5));
+    };
+    const onEnd = async () => {
+      if (!st.current.pulling) { st.current.startY = null; return; }
+      st.current.pulling = false;
+      st.current.startY = null;
+      if (st.current.lastDy >= threshold && !st.current.refreshing) {
+        st.current.refreshing = true;
+        setRefreshing(true);
+        setPull(threshold);
+        try { await onRefresh?.(); } finally {
+          st.current.refreshing = false;
+          setRefreshing(false);
+          setPull(0);
+        }
+      } else { setPull(0); }
+    };
+
+    el.addEventListener("touchstart", onStart, { passive: true });
+    el.addEventListener("touchmove", onMove, { passive: true });
+    el.addEventListener("touchend", onEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
+    };
+  }, [ref, disabled, threshold, onRefresh]);
+
+  return { ref, pull, refreshing };
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/idb.js ===
+─────────────────────────────────────────────────────────────────
+const DB_NAME = "ayeneh_db";
+const DB_VERSION = 2;
+const STORES = ["channels", "series", "meta", "videos"];
+
+let dbPromise = null;
+
+function openDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    try {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        STORES.forEach((s) => { if (!db.objectStoreNames.contains(s)) db.createObjectStore(s); });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) { reject(e); }
+  });
+  return dbPromise;
+}
+
+export async function idbGet(store, key) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(store, "readonly");
+      const req = tx.objectStore(store).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+}
+
+export async function idbSet(store, key, value) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(store, "readwrite");
+      tx.objectStore(store).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  } catch { return false; }
+}
+
+export async function idbDel(store, key) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction(store, "readwrite");
+      tx.objectStore(store).delete(key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  } catch { return false; }
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/lib/offlineVideo.js ===
+─────────────────────────────────────────────────────────────────
+import { idbGet, idbSet, idbDel } from "@/lib/idb";
+
+const STORE = "videos";
+const INDEX_KEY = "ayeneh_offline_index";
+const urlCache = new Map();
+
+function readIndex() {
+  try { return JSON.parse(localStorage.getItem(INDEX_KEY) || "[]"); } catch { return []; }
+}
+function writeIndex(list) {
+  localStorage.setItem(INDEX_KEY, JSON.stringify(list));
+  window.dispatchEvent(new Event("ayeneh-offline-changed"));
+}
+
+export function getOfflineIndex() { return readIndex(); }
+
+export async function getOfflineVideoUrl(fileUrl) {
+  if (urlCache.has(fileUrl)) return urlCache.get(fileUrl);
+  const blob = await idbGet(STORE, fileUrl);
+  if (!blob) return null;
+  const objUrl = URL.createObjectURL(blob);
+  urlCache.set(fileUrl, objUrl);
+  return objUrl;
+}
+
+export function getOfflineVideoUrlSync(fileUrl) {
+  return urlCache.has(fileUrl) ? urlCache.get(fileUrl) : null;
+}
+
+export async function isVideoOffline(fileUrl) {
+  if (urlCache.has(fileUrl)) return true;
+  const blob = await idbGet(STORE, fileUrl);
+  return !!blob;
+}
+
+export async function cacheVideoOffline(fileUrl, meta = {}, directUrl) {
+  const url = directUrl || fileUrl;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("fetch_failed");
+  const blob = await res.blob();
+  await idbSet(STORE, fileUrl, blob);
+  const list = readIndex().filter(e => e.fileUrl !== fileUrl);
+  list.push({ fileUrl, label: meta.label || fileUrl, size: blob.size, cachedAt: Date.now() });
+  writeIndex(list);
+  return true;
+}
+
+export async function removeOfflineVideo(fileUrl) {
+  if (urlCache.has(fileUrl)) { URL.revokeObjectURL(urlCache.get(fileUrl)); urlCache.delete(fileUrl); }
+  await idbDel(STORE, fileUrl);
+  writeIndex(readIndex().filter(e => e.fileUrl !== fileUrl));
+}
+
+export async function clearAllOffline() {
+  const list = readIndex();
+  for (const e of list) {
+    if (urlCache.has(e.fileUrl)) { URL.revokeObjectURL(urlCache.get(e.fileUrl)); urlCache.delete(e.fileUrl); }
+    await idbDel(STORE, e.fileUrl);
+  }
+  writeIndex([]);
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/MediaSplash.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useEffect, useState } from "react";
+import { Loader2 } from "lucide-react";
+import { LOGO_URL } from "@/lib/brandAssets";
+
+export default function MediaSplash({ onDone }) {
+  const [exiting, setExiting] = useState(false);
+
+  useEffect(() => {
+    const t1 = setTimeout(() => setExiting(true), 1500);
+    const t2 = setTimeout(() => onDone(), 2000);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [onDone]);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 9999,
+      background: "#0a0d16",
+      opacity: exiting ? 0 : 1,
+      transition: "opacity 0.5s ease-in-out",
+      display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", gap: "20px",
+    }}>
+      <img src={LOGO_URL} alt="Asemanak TV" style={{ width: 64, height: 64, opacity: 0.4 }} />
+      <Loader2 className="w-8 h-8 text-purple-400 animate-spin" />
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/SeriesCoverOverlay.jsx ===
+─────────────────────────────────────────────────────────────────
+import { Loader2 } from "lucide-react";
+
+export default function SeriesCoverOverlay({ poster, title, phase, visible = true, onReplay, posterPosition }) {
+  const isImage = poster && poster.match(/\.(jpg|jpeg|png|gif|webp|svg|avif)(\?|#|$)/i);
+  const objPos = posterPosition || 'center 20%';
+
+  return (
+    <div className="absolute inset-0 z-[35] overflow-hidden transition-opacity duration-700"
+      style={{ opacity: visible ? 1 : 0, pointerEvents: phase === "end" && visible ? "auto" : "none" }}>
+      {isImage ? (
+        <img src={poster} alt={title} className="absolute inset-0 w-full h-full object-cover"
+          style={{ objectPosition: objPos }} onError={(e) => { e.target.style.display = 'none'; }} />
+      ) : poster ? (
+        <video src={`${poster}#t=0.1`} className="absolute inset-0 w-full h-full object-cover"
+          style={{ objectPosition: objPos }} muted preload="metadata" playsInline />
+      ) : (
+        <div className="absolute inset-0" style={{ background: '#0a0d16' }} />
+      )}
+      {poster && (
+        <div className="absolute inset-0" style={{
+          background: 'linear-gradient(180deg, rgba(0,0,0,0.4) 0%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.6) 100%)'
+        }} />
+      )}
+      {phase === "start" && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <Loader2 className="w-10 h-10 text-purple-400 animate-spin" style={{ filter: 'drop-shadow(0 0 8px rgba(168,85,247,0.5))' }} />
+        </div>
+      )}
+      {phase === "end" && onReplay && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <button onClick={onReplay} data-remote
+            className="flex items-center gap-2 px-6 py-3 rounded-xl text-white font-semibold transition-all hover:scale-105"
+            style={{ background: 'rgba(123,44,191,0.6)', backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.2)' }}>
+            <Loader2 className="w-5 h-5" /> تماشای دوباره
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/VideoControls.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useState, useEffect } from "react";
+import { Play, Pause, Rewind, FastForward, Volume2, VolumeX, Sun, Settings2, Maximize, Shrink, ZoomIn, Languages, Check } from "lucide-react";
+
+const QUALITY_OPTIONS = [
+  { value: "auto", label: "Auto", ytKey: null },
+  { value: "1080p", label: "1080p", ytKey: "hd1080" },
+  { value: "720p", label: "720p", ytKey: "hd720" },
+  { value: "480p", label: "480p", ytKey: "large" },
+  { value: "360p", label: "360p", ytKey: "medium" },
+];
+
+const SCREEN_SIZES = [
+  { value: "full", label: "کامل", scale: 1.0 },
+  { value: "large", label: "بزرگ", scale: 0.85 },
+  { value: "medium", label: "متوسط", scale: 0.65 },
+  { value: "small", label: "کوچک", scale: 0.45 },
+];
+
+export default function VideoControls({ playerRef, onTogglePlay, isPlaying, brightness, onBrightnessChange, onScreenSizeChange, isTV = false, langPref = "fa", onLangChange }) {
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(100);
+  const [muted, setMuted] = useState(false);
+  const [quality, setQuality] = useState("auto");
+  const [showQualityMenu, setShowQualityMenu] = useState(false);
+  const [screenSize, setScreenSize] = useState("full");
+  const [showScreenMenu, setShowScreenMenu] = useState(false);
+  const [showLangMenu, setShowLangMenu] = useState(false);
+
+  const LANG_OPTIONS = [
+    { code: "fa", label: "فارسی", sub: "Persian" },
+    { code: "en", label: "English", sub: "انگلیسی" },
+    { code: "off", label: "خاموش", sub: "Off" },
+  ];
+  const [zoom, setZoom] = useState(1);
+  const ZOOM_LEVELS = [1, 1.25, 1.5, 2];
+  const cycleZoom = () => {
+    setZoom(prev => {
+      const idx = ZOOM_LEVELS.indexOf(prev);
+      const next = ZOOM_LEVELS[(idx + 1) % ZOOM_LEVELS.length];
+      if (onScreenSizeChange) onScreenSizeChange(next);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!playerRef.current) return;
+      try {
+        setCurrentTime(playerRef.current.getCurrentTime() || 0);
+        setDuration(playerRef.current.getDuration() || 0);
+      } catch {}
+    }, 500);
+    return () => clearInterval(interval);
+  }, [playerRef]);
+
+  const seekTo = (time) => {
+    if (!playerRef.current) return;
+    try { playerRef.current.seekTo(time, true); setCurrentTime(time); } catch {}
+  };
+  const seekBy = (delta) => { seekTo(Math.max(0, Math.min(duration, currentTime + delta))); };
+
+  const handleVolume = (v) => {
+    setVolume(v); setMuted(v === 0);
+    if (playerRef.current) {
+      try { if (v === 0) playerRef.current.mute(); else { playerRef.current.unMute(); playerRef.current.setVolume(v); } } catch {}
+    }
+  };
+
+  const changeQuality = (q) => {
+    setQuality(q); setShowQualityMenu(false);
+    if (!playerRef.current) return;
+    const opt = QUALITY_OPTIONS.find(o => o.value === q);
+    if (opt && opt.ytKey) {
+      try { playerRef.current.setPlaybackQualityRange(opt.ytKey, opt.ytKey); } catch {}
+      try { playerRef.current.setPlaybackQuality(opt.ytKey); } catch {}
+    } else {
+      try { playerRef.current.setPlaybackQualityRange("small", "hd1080"); } catch {}
+      try { playerRef.current.setPlaybackQuality("default"); } catch {}
+    }
+  };
+
+  const toggleMute = () => {
+    if (muted || volume === 0) {
+      setMuted(false); setVolume(50);
+      if (playerRef.current) { try { playerRef.current.unMute(); playerRef.current.setVolume(50); } catch {} }
+    } else {
+      setMuted(true);
+      if (playerRef.current) { try { playerRef.current.mute(); } catch {} }
+    }
+  };
+
+  const formatTime = (s) => {
+    if (!s || isNaN(s)) return "0:00";
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  return (
+    <div className="absolute bottom-0 left-0 right-0 z-30 px-3 pb-2 pt-10"
+      style={{ background: 'linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.92) 35%)' }}>
+      <div data-remote tabIndex={0} role="slider" className="w-full h-1.5 rounded-full bg-white/20 cursor-pointer mb-2 relative group"
+        onClick={(e) => { const rect = e.currentTarget.getBoundingClientRect(); const pct = (e.clientX - rect.left) / rect.width; seekTo(pct * duration); }}
+        onKeyDown={(e) => { if (e.key === "ArrowLeft") { e.preventDefault(); seekBy(-10); } if (e.key === "ArrowRight") { e.preventDefault(); seekBy(10); } }}>
+        <div className="h-full rounded-full" style={{ width: `${progress}%`, background: 'linear-gradient(90deg, #7b2cbf, #c77dff)' }} />
+        <div className="absolute top-1/2 w-3 h-3 rounded-full bg-white opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"
+          style={{ left: `${progress}%`, transform: 'translate(-50%, -50%)' }} />
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <button onClick={() => seekBy(-10)} data-remote className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/15 transition-colors flex-shrink-0"><Rewind className="w-4 h-4 text-white" /></button>
+        <button onClick={onTogglePlay} data-remote className="w-9 h-9 rounded-lg flex items-center justify-center hover:bg-white/15 transition-colors flex-shrink-0">{isPlaying ? <Pause className="w-5 h-5 text-white" /> : <Play className="w-5 h-5 text-white" />}</button>
+        <button onClick={() => seekBy(10)} data-remote className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/15 transition-colors flex-shrink-0"><FastForward className="w-4 h-4 text-white" /></button>
+        <span className="text-white/70 text-[11px] font-mono whitespace-nowrap mr-1">{formatTime(currentTime)} / {formatTime(duration)}</span>
+        {!isTV && (
+          <>
+            <div className="flex items-center gap-1.5 ml-1">
+              <button onClick={toggleMute} data-remote className="w-7 h-7 rounded-lg flex items-center justify-center hover:bg-white/15 transition-colors flex-shrink-0">{muted || volume === 0 ? <VolumeX className="w-4 h-4 text-white/70" /> : <Volume2 className="w-4 h-4 text-white" />}</button>
+              <input type="range" min={0} max={100} value={muted ? 0 : volume} onChange={(e) => handleVolume(parseInt(e.target.value))} className="w-14 h-1 cursor-pointer" style={{ accentColor: '#c77dff' }} />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Sun className="w-4 h-4 text-white/70 flex-shrink-0" />
+              <input type="range" min={20} max={150} value={Math.round(brightness * 100)} onChange={(e) => onBrightnessChange(parseInt(e.target.value) / 100)} className="w-14 h-1 cursor-pointer" style={{ accentColor: '#c77dff' }} />
+            </div>
+            <button onClick={cycleZoom} data-remote className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/15 transition-colors flex-shrink-0" title="زوم">
+              <ZoomIn className="w-4 h-4 text-white/70" /><span className="text-white/70 text-[11px] font-medium">{zoom === 1 ? "زوم" : `${zoom}x`}</span>
+            </button>
+          </>
+        )}
+        <div className="relative flex-shrink-0">
+          <button onClick={() => setShowScreenMenu(v => !v)} data-remote className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/15 transition-colors" title="سایز صفحه">
+            {screenSize === "full" ? <Maximize className="w-4 h-4 text-white/70" /> : <Shrink className="w-4 h-4 text-white/70" />}
+            <span className="text-white/70 text-[11px] font-medium">{SCREEN_SIZES.find(s => s.value === screenSize)?.label || "کامل"}</span>
+          </button>
+          {showScreenMenu && (
+            <div className="absolute bottom-full right-0 mb-2 rounded-xl overflow-hidden backdrop-blur-md" style={{ background: "rgba(10,13,22,0.95)", border: "1px solid rgba(255,255,255,0.15)", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", minWidth: "110px" }}>
+              <p className="px-4 py-1.5 text-[10px] text-white/40 uppercase tracking-wider border-b border-white/10">سایز صفحه</p>
+              {SCREEN_SIZES.map(opt => (
+                <button key={opt.value} data-remote onClick={() => { setScreenSize(opt.value); setShowScreenMenu(false); if (onScreenSizeChange) onScreenSizeChange(opt.scale); }}
+                  className={`flex items-center gap-2 px-4 py-2 hover:bg-white/5 transition-colors w-full text-right ${screenSize === opt.value ? "text-cyan-400" : "text-white/70"}`}>
+                  <span className="text-xs">{opt.label}</span>{screenSize === opt.value && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-cyan-400" />}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="relative flex-shrink-0">
+          <button onClick={() => setShowQualityMenu(v => !v)} data-remote className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/15 transition-colors" title="کیفیت">
+            <Settings2 className="w-4 h-4 text-white/70" /><span className="text-white/70 text-[11px] font-medium">{quality === "auto" ? "Auto" : quality}</span>
+          </button>
+          {showQualityMenu && (
+            <div className="absolute bottom-full right-0 mb-2 rounded-xl overflow-hidden backdrop-blur-md" style={{ background: "rgba(10,13,22,0.95)", border: "1px solid rgba(255,255,255,0.15)", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", minWidth: "100px" }}>
+              <p className="px-4 py-1.5 text-[10px] text-white/40 uppercase tracking-wider border-b border-white/10">کیفیت</p>
+              {QUALITY_OPTIONS.map(opt => (
+                <button key={opt.value} data-remote onClick={() => changeQuality(opt.value)}
+                  className={`flex items-center gap-2 px-4 py-2 hover:bg-white/5 transition-colors w-full text-right ${quality === opt.value ? "text-cyan-400" : "text-white/70"}`}>
+                  <span className="text-xs">{opt.label}</span>{quality === opt.value && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-cyan-400" />}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {isTV && (
+          <div className="relative flex-shrink-0">
+            <button onClick={() => setShowLangMenu(v => !v)} data-remote className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/15 transition-colors" title="زبان / Language">
+              <Languages className="w-4 h-4 text-white/70" /><span className="text-white/70 text-[11px] font-medium">{langPref === "fa" ? "فارسی" : langPref === "en" ? "English" : "خاموش"}</span>
+            </button>
+            {showLangMenu && (
+              <div className="absolute bottom-full right-0 mb-2 rounded-xl overflow-hidden backdrop-blur-md" style={{ background: "rgba(10,13,22,0.95)", border: "1px solid rgba(255,255,255,0.15)", boxShadow: "0 8px 24px rgba(0,0,0,0.5)", minWidth: "130px" }}>
+                <p className="px-4 py-1.5 text-[10px] text-white/40 uppercase tracking-wider border-b border-white/10">زبان / Language</p>
+                {LANG_OPTIONS.map(opt => (
+                  <button key={opt.code} data-remote onClick={() => { if (onLangChange) onLangChange(opt.code); setShowLangMenu(false); }}
+                    className={`flex items-center gap-2 px-4 py-2 hover:bg-white/5 transition-colors w-full text-right ${langPref === opt.code ? "text-cyan-400" : "text-white/70"}`}>
+                    <span className="text-xs flex-1">{opt.label}</span><span className="text-[9px] text-white/30">{opt.sub}</span>{langPref === opt.code && <Check className="w-3.5 h-3.5 ml-1" />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        <span className="ml-auto text-white/40 text-[10px] font-medium flex items-center gap-1.5 whitespace-nowrap">
+          <div className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" /> پخش از آسمانک تی وی
+        </span>
+      </div>
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/SeriesReorderModal.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useState } from "react";
+import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
+import { X, GripVertical, Save, Loader2 } from "lucide-react";
+import { base44 } from "@/api/base44Client";
+
+export default function SeriesReorderModal({ series, onClose, onSaved, isFa = true }) {
+  const [items, setItems] = useState(() =>
+    [...series].sort((a, b) => {
+      const aOrder = Number(a.sortOrder) || 0;
+      const bOrder = Number(b.sortOrder) || 0;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return new Date(b.created_date || 0) - new Date(a.created_date || 0);
+    })
+  );
+  const [saving, setSaving] = useState(false);
+  const tr = (fa, en) => isFa ? fa : en;
+
+  const onDragEnd = (result) => {
+    if (!result.destination) return;
+    const reordered = Array.from(items);
+    const [moved] = reordered.splice(result.source.index, 1);
+    reordered.splice(result.destination.index, 0, moved);
+    setItems(reordered);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const updates = items.map((s, i) => ({ id: s.id, sortOrder: i }));
+      await base44.entities.Series.bulkUpdate(updates);
+      if (onSaved) onSaved();
+      onClose();
+    } catch { setSaving(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[75] flex items-center justify-center bg-black/85" onClick={onClose}>
+      <div className="w-full max-w-lg mx-4 rounded-2xl flex flex-col max-h-[85vh] overflow-hidden"
+        style={{ background: 'rgba(13,17,30,0.98)', border: '1px solid rgba(168,85,247,0.25)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 flex-shrink-0" style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+          <p className="text-white font-bold text-base">{tr("ترتیب نمایش سریال‌ها", "Reorder Series")}</p>
+          <button onClick={onClose} data-remote className="text-white/40 hover:text-white"><X className="w-5 h-5" /></button>
+        </div>
+        <p className="text-white/40 text-xs px-5 py-2.5 flex-shrink-0">{tr("برای جابجایی، کارت‌ها را بکشید و رها کنید", "Drag and drop cards to reorder")}</p>
+        <div className="flex-1 overflow-y-auto px-3 pb-3">
+          <DragDropContext onDragEnd={onDragEnd}>
+            <Droppable droppableId="series-list">
+              {(provided) => (
+                <div ref={provided.innerRef} {...provided.droppableProps} className="flex flex-col gap-2">
+                  {items.map((s, i) => (
+                    <Draggable key={s.id} draggableId={s.id} index={i}>
+                      {(prov, snapshot) => (
+                        <div ref={prov.innerRef} {...prov.draggableProps} {...prov.dragHandleProps}
+                          className="flex items-center gap-3 rounded-xl p-2.5 transition-all"
+                          style={{ background: snapshot.isDragging ? 'rgba(168,85,247,0.2)' : 'rgba(255,255,255,0.04)', border: snapshot.isDragging ? '1px solid rgba(168,85,247,0.5)' : '1px solid rgba(255,255,255,0.08)', ...prov.draggableProps.style }}>
+                          <GripVertical className="w-5 h-5 text-white/30 flex-shrink-0" />
+                          <span className="text-white/30 text-xs font-bold w-6 text-center flex-shrink-0">{i + 1}</span>
+                          <div className="w-10 h-14 rounded-lg overflow-hidden flex-shrink-0 bg-black/40">
+                            {s.poster ? <img src={s.poster} alt="" className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center text-white/20 text-[10px]">{tr("بدون کاور", "No cover")}</div>}
+                          </div>
+                          <p className="text-white text-sm font-semibold truncate flex-1">{s.title}</p>
+                          <span className="text-white/30 text-[10px] flex-shrink-0">{(s.episodes || []).length} {tr("قسمت", "eps")}</span>
+                        </div>
+                      )}
+                    </Draggable>
+                  ))}
+                  {provided.placeholder}
+                </div>
+              )}
+            </Droppable>
+          </DragDropContext>
+        </div>
+        <div className="flex gap-2 px-5 py-4 flex-shrink-0" style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+          <button onClick={onClose} data-remote className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white/70 transition-colors hover:bg-white/5" style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}>{tr("انصراف", "Cancel")}</button>
+          <button onClick={save} disabled={saving} data-remote className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white transition-colors disabled:opacity-50 flex items-center justify-center gap-2" style={{ background: 'linear-gradient(135deg, #7b2cbf, #9d4edd)' }}>
+            {saving ? <><Loader2 className="w-4 h-4 animate-spin" /> {tr("ذخیره...", "Saving...")}</> : <><Save className="w-4 h-4" /> {tr("ذخیره ترتیب", "Save Order")}</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/AddEpisodeForm.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useState, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import { X, Loader2, Link2, Type, AlertCircle, Upload, Film, Video, Hash } from "lucide-react";
+
+function extractVideoId(url) {
+  if (!url) return null;
+  const patterns = [/[?&]v=([a-zA-Z0-9_-]{11})/, /youtu\.be\/([a-zA-Z0-9_-]{11})/, /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/, /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/];
+  for (const p of patterns) { const m = url.match(p); if (m) return m[1]; }
+  if (/^[a-zA-Z0-9_-]{11}$/.test(url.trim())) return url.trim();
+  return null;
+}
+function isDirectVideoUrl(url) {
+  if (!url) return false;
+  const lower = url.toLowerCase().split("?")[0];
+  return /\.(mp4|webm|ogg|mkv|m3u8|mov|avi|m4v)(\?|$)/.test(lower);
+}
+function extractAparatHash(url) {
+  if (!url) return null;
+  const m = url.match(/aparat\.com\/v\/([a-zA-Z0-9]+)/);
+  return m ? m[1] : null;
+}
+const MAX_VIDEO_MB = 1000;
+const MAX_VIDEO_SIZE = MAX_VIDEO_MB * 1024 * 1024;
+function fmtSize(bytes) {
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+function uploadWithTimeout(file, timeoutMs = 1200000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+    base44.integrations.Core.UploadFile({ file }).then(res => { clearTimeout(timer); resolve(res); }).catch(e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+export default function AddEpisodeForm({ onAdd, onClose, nextNumber = 1, currentSeason = 1, isFa = true }) {
+  const [mode, setMode] = useState("youtube");
+  const [url, setUrl] = useState("");
+  const [title, setTitle] = useState("");
+  const [number, setNumber] = useState(String(nextNumber));
+  const [season, setSeason] = useState(String(currentSeason));
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [videoFile, setVideoFile] = useState(null);
+  const fileInputRef = useRef(null);
+  const tr = (f, e) => isFa ? f : e;
+
+  const submit = async () => {
+    setError(null);
+    const epTitle = title.trim() || `${tr("قسمت", "Episode")} ${Number(number) || nextNumber}`;
+    const epNumber = Number(number) || nextNumber;
+    if (mode === "gallery") {
+      if (!videoFile) { setError(tr("یک ویدیو از گالری انتخاب کنید", "Pick a video from gallery")); return; }
+      if (videoFile.size > MAX_VIDEO_SIZE) { setError(tr(`فایل (${fmtSize(videoFile.size)}) بزرگ‌تر از ${MAX_VIDEO_MB} مگابایت است.`, `File (${fmtSize(videoFile.size)}) is larger than ${MAX_VIDEO_MB}MB.`)); return; }
+      setLoading(true); setUploadProgress(0);
+      const estimatedSeconds = Math.max(5, videoFile.size / (5 * 1024 * 1024));
+      const startTime = Date.now();
+      const progressInterval = setInterval(() => { const elapsed = (Date.now() - startTime) / 1000; setUploadProgress(Math.min(95, (elapsed / estimatedSeconds) * 100)); }, 200);
+      try {
+        const res = await uploadWithTimeout(videoFile);
+        clearInterval(progressInterval); setUploadProgress(100);
+        onAdd({ fileUrl: res.file_url, title: epTitle, number: epNumber, season: Number(season) || 1 });
+        onClose();
+      } catch (e) {
+        clearInterval(progressInterval); setUploadProgress(0);
+        setError(e?.message === "timeout" ? tr(`آپلود طول کشید — فایل کمتر از ${MAX_VIDEO_MB} مگابایت.`, `Upload timed out — pick a file under ${MAX_VIDEO_MB}MB.`) : tr("خطا در آپلود فایل", "Upload failed"));
+        setLoading(false);
+      }
+      return;
+    }
+    const trimmed = url.trim();
+    if (!trimmed) { setError(tr("لینک را وارد کنید", "Enter a link")); return; }
+    setLoading(true);
+    if (mode === "youtube") {
+      const vid = extractVideoId(trimmed);
+      if (!vid) { setError(tr("لینک یوتیوب معتبر نیست", "Invalid YouTube link")); setLoading(false); return; }
+      onAdd({ videoId: vid, title: epTitle, number: epNumber, season: Number(season) || 1 }); onClose(); return;
+    }
+    const aparat = extractAparatHash(trimmed);
+    if (aparat) { onAdd({ embedUrl: `https://www.aparat.com/video/video/embed/videohash/${aparat}/vt/frame`, title: epTitle, number: epNumber, season: Number(season) || 1 }); onClose(); return; }
+    if (isDirectVideoUrl(trimmed)) { onAdd({ fileUrl: trimmed, title: epTitle, number: epNumber, season: Number(season) || 1 }); onClose(); return; }
+    setError(tr("لینک مستقیم ویدیو (mp4, webm, m3u8) یا لینک آپارات وارد کنید", "Enter a direct video link (mp4/webm/m3u8) or Aparat link"));
+    setLoading(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/85" onClick={onClose}>
+      <div className="w-full max-w-md mx-4 rounded-2xl p-6 flex flex-col gap-4 max-h-[92vh] overflow-y-auto"
+        style={{ background: 'rgba(13,17,30,0.98)', border: '1px solid rgba(34,211,238,0.25)' }}
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <p className="text-white font-bold text-base">{tr("افزودن قسمت جدید", "Add New Episode")}</p>
+          <button onClick={onClose} data-remote className="text-white/40 hover:text-white"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="flex rounded-xl overflow-hidden border border-white/10">
+          <button onClick={() => setMode("youtube")} data-remote className={`flex-1 py-2.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 ${mode === "youtube" ? "bg-purple-600/30 text-purple-300" : "text-white/40 hover:text-white"}`}><Link2 className="w-3.5 h-3.5" /> {tr("یوتیوب", "YouTube")}</button>
+          <button onClick={() => setMode("link")} data-remote className={`flex-1 py-2.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 ${mode === "link" ? "bg-cyan-600/30 text-cyan-300" : "text-white/40 hover:text-white"}`}><Video className="w-3.5 h-3.5" /> {tr("لینک مستقیم", "Direct Link")}</button>
+          <button onClick={() => setMode("gallery")} data-remote className={`flex-1 py-2.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 ${mode === "gallery" ? "bg-cyan-600/30 text-cyan-300" : "text-white/40 hover:text-white"}`}><Upload className="w-3.5 h-3.5" /> {tr("گالری", "Gallery")}</button>
+        </div>
+        <div>
+          <label className="text-xs text-white/40 mb-1 flex items-center gap-1.5"><Type className="w-3 h-3" /> {tr("عنوان قسمت", "Episode title")}</label>
+          <input value={title} onChange={e => setTitle(e.target.value)} data-remote placeholder={`${tr("قسمت", "Episode")} ${nextNumber}`} className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-white/25 outline-none focus:border-cyan-500/50" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <label className="text-xs text-white/40 mb-1 flex items-center gap-1.5"><Hash className="w-3 h-3" /> {tr("شماره قسمت", "Episode number")}</label>
+            <input type="number" min="1" value={number} onChange={e => setNumber(e.target.value)} data-remote className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white outline-none focus:border-cyan-500/50" />
+          </div>
+          <div className="flex-1">
+            <label className="text-xs text-white/40 mb-1 flex items-center gap-1.5"><Hash className="w-3 h-3" /> {tr("فصل", "Season")}</label>
+            <input type="number" min="1" value={season} onChange={e => setSeason(e.target.value)} data-remote className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white outline-none focus:border-cyan-500/50" />
+          </div>
+        </div>
+        {mode === "youtube" ? (
+          <div>
+            <label className="text-xs text-white/40 mb-1 flex items-center gap-1.5"><Link2 className="w-3 h-3" /> {tr("لینک ویدیوی یوتیوب", "YouTube video link")}</label>
+            <input value={url} onChange={e => setUrl(e.target.value)} data-remote placeholder="https://youtube.com/watch?v=... یا youtu.be/..." className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-white/25 outline-none focus:border-purple-500/50" />
+          </div>
+        ) : mode === "link" ? (
+          <div>
+            <label className="text-xs text-white/40 mb-1 flex items-center gap-1.5"><Video className="w-3 h-3" /> {tr("لینک مستقیم ویدیو", "Direct video link")}</label>
+            <input value={url} onChange={e => setUrl(e.target.value)} data-remote placeholder="https://example.com/ep.mp4 یا آپارات" className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-white/25 outline-none focus:border-cyan-500/50" />
+            <p className="text-[11px] text-cyan-400/60 mt-1.5">ⓘ {tr("لینک مستقیم فایل ویدیو (mp4, webm, m3u8) یا لینک آپارات", "Direct video file (mp4/webm/m3u8) or Aparat link")}</p>
+          </div>
+        ) : (
+          <div>
+            <label className="text-xs text-white/40 mb-1.5 flex items-center gap-1.5"><Film className="w-3 h-3" /> {tr("فایل ویدیو", "Video file")}</label>
+            <button onClick={() => fileInputRef.current?.click()} data-remote className="w-full border-2 border-dashed border-white/15 rounded-xl py-6 flex flex-col items-center gap-2 hover:border-cyan-500/50 transition-colors">
+              <Upload className="w-7 h-7 text-white/40" />
+              <span className="text-xs text-white/50">{videoFile ? videoFile.name : (tr("انتخاب ویدیو از گالری", "Pick a video from gallery"))}</span>
+              {videoFile && <span className={`text-[11px] ${videoFile.size > MAX_VIDEO_SIZE ? "text-red-400" : "text-white/30"}`}>{fmtSize(videoFile.size)}</span>}
+            </button>
+            <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={e => setVideoFile(e.target.files?.[0] || null)} />
+            <p className="text-[11px] text-white/30">ⓘ {tr(`حداکثر ${MAX_VIDEO_MB} مگابایت برای هر ویدیو`, `Max ${MAX_VIDEO_MB}MB per video`)}</p>
+          </div>
+        )}
+        {error && (<div className="flex items-center gap-2 text-red-400 text-xs bg-red-500/10 border border-red-500/20 rounded-xl px-3 py-2"><AlertCircle className="w-3.5 h-3.5 flex-shrink-0" /> {error}</div>)}
+        {loading && mode === "gallery" && uploadProgress > 0 && (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between text-xs"><span className="text-white/60">{tr("در حال آپلود...", "Uploading...")}</span><span className="text-cyan-400 font-bold">{Math.round(uploadProgress)}%</span></div>
+            <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden"><div className="h-full rounded-full transition-all duration-200" style={{ width: `${uploadProgress}%`, background: 'linear-gradient(90deg, #0e7490, #22d3ee)' }} /></div>
+            <p className="text-white/30 text-[10px] text-center">{tr("لطفاً صبر کنید — آپلود ممکن است چند دقیقه طول بکشد", "Please wait — upload may take a few minutes")}</p>
+          </div>
+        )}
+        <button onClick={submit} data-remote disabled={loading || (mode !== "gallery" ? !url.trim() : !videoFile)}
+          className="w-full py-3 rounded-xl text-sm font-bold text-white transition-colors disabled:opacity-40 flex items-center justify-center gap-2"
+          style={{ background: 'linear-gradient(135deg, #0e7490, #22d3ee)', boxShadow: '0 4px 15px rgba(34,211,238,0.35)' }}>
+          {loading ? <><Loader2 className="w-4 h-4 animate-spin" /> {mode === "gallery" ? tr("در حال آپلود...", "Uploading...") : tr("در حال پردازش...", "Processing...")}</> : (tr("افزودن قسمت", "Add Episode"))}
+        </button>
+      </div>
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/SeriesContextMenu.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useState, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import { X, Trash2, Pencil, ImagePlus, Upload, Loader2, Heart, Plus, Download, Check, Music, EyeOff } from "lucide-react";
+import { cacheVideoOffline, removeOfflineVideo, isVideoOffline, getOfflineIndex } from "@/lib/offlineVideo";
+
+const MEDIA_FAV_KEY = "ayeneh_media_favorites";
+
+function isMediaFav(id) {
+  try { return JSON.parse(localStorage.getItem(MEDIA_FAV_KEY) || "[]").includes(id); } catch { return false; }
+}
+function toggleMediaFav(id) {
+  try {
+    const list = JSON.parse(localStorage.getItem(MEDIA_FAV_KEY) || "[]");
+    const next = list.includes(id) ? list.filter(x => x !== id) : [...list, id];
+    localStorage.setItem(MEDIA_FAV_KEY, JSON.stringify(next));
+    window.dispatchEvent(new Event("ayeneh-media-favorites-changed"));
+    return !list.includes(id);
+  } catch { return false; }
+}
+
+function parsePosterPos(pos) {
+  if (!pos) return { x: 50, y: 20 };
+  const parts = pos.trim().split(/\s+/);
+  const parseVal = (v) => {
+    if (v === "center") return 50;
+    if (v === "top" || v === "left") return 0;
+    if (v === "bottom" || v === "right") return 100;
+    return parseInt(v) || 50;
+  };
+  return { x: parts[0] ? parseVal(parts[0]) : 50, y: parts[1] ? parseVal(parts[1]) : 20 };
+}
+
+export default function SeriesContextMenu({ series, onDelete, onRename, onChangePhoto, onAddEpisode, onClose, isAdmin = false }) {
+  const [mode, setMode] = useState("menu");
+  const [isFav, setIsFav] = useState(() => isMediaFav(series.id));
+  const [nameInput, setNameInput] = useState(series.title);
+  const [photoInput, setPhotoInput] = useState(series.poster || "");
+  const [uploading, setUploading] = useState(false);
+  const [musicUploading, setMusicUploading] = useState(false);
+  const initialPos = parsePosterPos(series.posterPosition);
+  const [posX, setPosX] = useState(initialPos.x);
+  const [posY, setPosY] = useState(initialPos.y);
+  const fileRef = useRef(null);
+  const musicRef = useRef(null);
+
+  const downloadableEps = (series.episodes || []).filter(ep => ep.fileUrl);
+  const [downloadedCount, setDownloadedCount] = useState(() => {
+    const idx = getOfflineIndex();
+    return downloadableEps.filter(ep => idx.some(e => e.fileUrl === ep.fileUrl)).length;
+  });
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState({ current: 0, total: 0 });
+  const isFullyDownloaded = downloadableEps.length > 0 && downloadedCount === downloadableEps.length;
+
+  const handleDownloadSeries = async () => {
+    if (downloadableEps.length === 0) return;
+    setDownloading(true);
+    setDownloadProgress({ current: 0, total: downloadableEps.length });
+    try {
+      for (let i = 0; i < downloadableEps.length; i++) {
+        const ep = downloadableEps[i];
+        const isAlready = await isVideoOffline(ep.fileUrl);
+        if (!isAlready) { await cacheVideoOffline(ep.fileUrl, { label: `${series.title} — ${ep.title || `قسمت ${ep.number}`}` }); }
+        setDownloadProgress({ current: i + 1, total: downloadableEps.length });
+      }
+      setDownloadedCount(downloadableEps.length);
+    } catch { window.alert("دانلود ناموفق بود — ممکن است فایل‌ها خیلی بزرگ باشند"); }
+    finally { setDownloading(false); }
+  };
+
+  const handleRemoveDownload = async () => {
+    for (const ep of downloadableEps) { await removeOfflineVideo(ep.fileUrl); }
+    setDownloadedCount(0);
+  };
+
+  const handlePickFile = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setUploading(true);
+    try { const res = await base44.integrations.Core.UploadFile({ file: f }); setPhotoInput(res.file_url); }
+    catch { alert("آپلود ناموفق بود"); }
+    finally { setUploading(false); }
+  };
+
+  const handlePickMusic = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.size > 5 * 1024 * 1024) { alert("فایل صوتی باید کمتر از ۵ مگابایت باشد"); return; }
+    setMusicUploading(true);
+    try {
+      const res = await base44.integrations.Core.UploadFile({ file: f });
+      await base44.entities.Series.update(series.id, { coverMusic: res.file_url });
+      window.location.reload();
+    } catch { alert("آپلود موسیقی ناموفق بود"); }
+    finally { setMusicUploading(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center" style={{ paddingTop: '8vh' }} onClick={onClose}>
+      <div className="absolute inset-0 bg-black/80" />
+      <div className="relative z-10 w-80 rounded-2xl p-5 border border-white/10" style={{ background: 'rgba(13,17,23,0.98)' }} onClick={e => e.stopPropagation()}>
+        {mode === "menu" && (
+          <>
+            <div className="flex items-center gap-3 mb-4">
+              {series.poster && <img src={series.poster} className="w-10 h-14 rounded object-cover" onError={e => { e.target.style.display = 'none'; }} />}
+              <p className="text-white font-bold text-sm truncate flex-1">{series.title}</p>
+              <button onClick={onClose} data-remote className="text-white/40 hover:text-white"><X className="w-4 h-4" /></button>
+            </div>
+            <div className="space-y-2">
+              {isAdmin && (<button onClick={() => setMode("rename")} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm"><Pencil className="w-4 h-4 text-purple-400" /> تغییر اسم سریال</button>)}
+              {isAdmin && (<button onClick={() => setMode("photo")} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm"><ImagePlus className="w-4 h-4 text-cyan-400" /> تغییر عکس سریال</button>)}
+              <button onClick={() => setIsFav(toggleMediaFav(series.id))} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm">
+                <Heart className={`w-4 h-4 ${isFav ? "text-pink-500 fill-pink-500" : "text-pink-400"}`} />
+                {isFav ? "حذف از علاقه‌مندی‌ها" : "افزودن به علاقه‌مندی‌ها"}
+              </button>
+              {isAdmin && (
+                <label className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm cursor-pointer">
+                  <Music className={`w-4 h-4 ${series.coverMusic ? "text-green-400" : "text-cyan-400"}`} />
+                  {musicUploading ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> در حال آپلود...</> : series.coverMusic ? "تغییر موسیقی کاور ✓" : "افزودن موسیقی کاور (چند ثانیه)"}
+                  <input ref={musicRef} type="file" accept="audio/*" className="hidden" onChange={handlePickMusic} />
+                </label>
+              )}
+              {downloadableEps.length > 0 && (
+                <>
+                  {downloading ? (
+                    <div className="px-4 py-3">
+                      <div className="flex items-center gap-2 text-white/80 text-sm mb-2"><Loader2 className="w-4 h-4 text-cyan-400 animate-spin" /> در حال دانلود... {downloadProgress.current}/{downloadProgress.total}</div>
+                      <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden"><div className="h-full rounded-full transition-all" style={{ width: `${(downloadProgress.current / downloadProgress.total) * 100}%`, background: 'linear-gradient(90deg, #0e7490, #22d3ee)' }} /></div>
+                    </div>
+                  ) : isFullyDownloaded ? (
+                    <button onClick={handleRemoveDownload} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm"><Check className="w-4 h-4 text-green-400" /> حذف دانلود آفلاین ({downloadableEps.length} قسمت)</button>
+                  ) : (
+                    <button onClick={handleDownloadSeries} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm"><Download className="w-4 h-4 text-cyan-400" /> {downloadedCount > 0 ? `ادامه دانلود (${downloadedCount}/${downloadableEps.length})` : `دانلود سریال (${downloadableEps.length} قسمت)`}</button>
+                  )}
+                </>
+              )}
+              {isAdmin && onAddEpisode && (<button onClick={onAddEpisode} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm"><Plus className="w-4 h-4 text-cyan-400" /> افزودن قسمت جدید</button>)}
+              {isAdmin && (
+                <button onClick={async () => { try { await base44.entities.Series.update(series.id, { hideOverlays: !series.hideOverlays }); window.location.reload(); } catch {} }} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-white/80 hover:text-white hover:bg-white/5 transition-colors text-sm">
+                  <EyeOff className={`w-4 h-4 ${series.hideOverlays ? "text-cyan-400" : "text-cyan-400/60"}`} />
+                  {series.hideOverlays ? "غیرفعال‌کردن پنهان‌سازی ویدیو" : "پنهان‌کردن لوگو/نوشته ویدیو"}
+                </button>
+              )}
+              {isAdmin && (
+                <>
+                  <div className="my-2 border-t border-white/10" />
+                  <button onClick={() => { if (window.confirm('حذف این سریال؟')) onDelete(); }} data-remote className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-red-400 hover:bg-red-500/10 transition-colors text-sm"><Trash2 className="w-4 h-4" /> حذف سریال</button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+        {mode === "rename" && (
+          <>
+            <p className="text-white font-bold text-sm mb-3">تغییر اسم سریال</p>
+            <input value={nameInput} onChange={e => setNameInput(e.target.value)} data-remote className="w-full text-white text-sm px-3 py-2.5 rounded-xl outline-none mb-3" style={{ background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)' }} autoFocus />
+            <div className="flex gap-2">
+              <button onClick={() => onRename(nameInput)} data-remote className="flex-1 py-2.5 rounded-xl text-white text-sm font-bold" style={{ background: 'linear-gradient(135deg, #7b2cbf, #9d4edd)' }}>ذخیره</button>
+              <button onClick={() => setMode("menu")} data-remote className="px-4 py-2.5 rounded-xl text-white/60 text-sm bg-white/5">بازگشت</button>
+            </div>
+          </>
+        )}
+        {mode === "photo" && (
+          <>
+            <p className="text-white font-bold text-sm mb-3">تغییر عکس سریال</p>
+            <button onClick={() => fileRef.current?.click()} data-remote className="w-full mb-3 border-2 border-dashed border-cyan-500/30 rounded-xl py-4 flex flex-col items-center gap-1.5 hover:border-cyan-500/60 transition-colors">
+              {uploading ? <Loader2 className="w-5 h-5 text-cyan-400 animate-spin" /> : <Upload className="w-5 h-5 text-cyan-400" />}
+              <span className="text-xs text-cyan-300/80">{uploading ? "در حال آپلود..." : "آپلود از گالری"}</span>
+            </button>
+            <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handlePickFile} />
+            <p className="text-white/40 text-xs mb-2">یا آدرس عکس (URL) را وارد کنید:</p>
+            <input value={photoInput} onChange={e => setPhotoInput(e.target.value)} data-remote placeholder="https://..." className="w-full text-white text-sm px-3 py-2.5 rounded-xl outline-none mb-3" style={{ background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)' }} />
+            {photoInput && (
+              <div className="mb-3">
+                <p className="text-white/40 text-xs mb-2">تنظیم موقعیت عکس:</p>
+                <div className="w-full h-40 rounded-xl overflow-hidden mb-3 relative bg-black/40">
+                  <img src={photoInput} alt="preview" className="w-full h-full object-cover" style={{ objectPosition: `${posX}% ${posY}%` }} onError={e => { e.target.style.display = 'none'; }} />
+                </div>
+                <div className="space-y-2.5">
+                  <div>
+                    <label className="text-xs text-white/50 flex items-center justify-between mb-1"><span>موقعیت افقی</span><span className="text-cyan-400 font-bold">{posX}%</span></label>
+                    <input type="range" min="0" max="100" value={posX} onChange={e => setPosX(Number(e.target.value))} className="w-full h-1.5 cursor-pointer" style={{ accentColor: '#22d3ee' }} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/50 flex items-center justify-between mb-1"><span>موقعیت عمودی</span><span className="text-cyan-400 font-bold">{posY}%</span></label>
+                    <input type="range" min="0" max="100" value={posY} onChange={e => setPosY(Number(e.target.value))} className="w-full h-1.5 cursor-pointer" style={{ accentColor: '#22d3ee' }} />
+                  </div>
+                </div>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button onClick={() => onChangePhoto(photoInput, `${posX}% ${posY}%`)} disabled={uploading} data-remote className="flex-1 py-2.5 rounded-xl text-white text-sm font-bold disabled:opacity-40" style={{ background: 'linear-gradient(135deg, #7b2cbf, #9d4edd)' }}>ذخیره</button>
+              <button onClick={() => setMode("menu")} data-remote className="px-4 py-2.5 rounded-xl text-white/60 text-sm bg-white/5">بازگشت</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+=== FILE: src/components/media/TrailerPlayer.jsx ===
+─────────────────────────────────────────────────────────────────
+import { useRef, useEffect, useState } from "react";
+import { X, Pause, Play, Volume2, VolumeX } from "lucide-react";
+
+const LOGO_URL = "https://media.base44.com/images/public/69bb192550659e77af7bd3fe/6472c90ea_file_0000000096cc71fd92231a0dad14e023.png";
+
+export default function TrailerPlayer({ series, onSkip, onClose }) {
+  const playerRef = useRef(null);
+  const containerRef = useRef(null);
+  const mountedRef = useRef(true);
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const mutedRef = useRef(false);
+  const [ready, setReady] = useState(false);
+
+  const firstEp = (series?.episodes || [])[0];
+  const videoId = firstEp?.videoId;
+  const fileUrl = firstEp?.fileUrl;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!videoId) { onSkip(); return; }
+    const init = () => {
+      if (!mountedRef.current || !containerRef.current) return;
+      if (playerRef.current) { try { playerRef.current.destroy(); } catch {} }
+      playerRef.current = new window.YT.Player(containerRef.current, {
+        videoId, width: "100%", height: "100%",
+        playerVars: { autoplay: 1, mute: 0, controls: 0, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, disablekb: 1, fs: 0 },
+        events: {
+          onReady: (e) => {
+            if (!mountedRef.current) return;
+            try { e.target.seekTo(15, true); e.target.unMute(); e.target.setVolume(100); e.target.playVideo(); e.target.setPlaybackQualityRange("hd720", "hd720"); } catch {}
+            setReady(true);
+            setTimeout(() => { if (mountedRef.current && playerRef.current) { try { if (playerRef.current.getPlayerState() !== 1) { playerRef.current.mute(); mutedRef.current = true; setMuted(true); playerRef.current.playVideo(); } } catch {} } }, 3000);
+          },
+          onStateChange: (e) => {
+            if (!mountedRef.current) return;
+            const st = e.data;
+            if (st === window.YT.PlayerState.PLAYING) setIsPlaying(true);
+            else if (st === window.YT.PlayerState.PAUSED) setIsPlaying(false);
+            else if (st === window.YT.PlayerState.ENDED) onSkip();
+          },
+          onError: () => { if (mountedRef.current) onSkip(); },
+        },
+      });
+    };
+    if (window.YT && window.YT.Player) init();
+    else {
+      if (!window.ytApiLoading) { window.ytApiLoading = true; const tag = document.createElement("script"); tag.src = "https://www.youtube.com/iframe_api"; document.body.appendChild(tag); }
+      const prev = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = () => { if (prev) prev(); init(); };
+      const check = setInterval(() => { if (window.YT && window.YT.Player) { clearInterval(check); init(); } }, 200);
+      setTimeout(() => clearInterval(check), 8000);
+    }
+    return () => { mountedRef.current = false; if (playerRef.current) { try { playerRef.current.stopVideo(); } catch {} try { playerRef.current.destroy(); } catch {} playerRef.current = null; } };
+  }, [videoId]);
+
+  const togglePlay = () => { if (!playerRef.current) return; try { if (isPlaying) playerRef.current.pauseVideo(); else playerRef.current.playVideo(); } catch {} };
+  const toggleMute = () => { if (!playerRef.current) return; const next = !muted; mutedRef.current = next; try { if (next) { playerRef.current.mute(); } else { playerRef.current.unMute(); playerRef.current.setVolume(100); } } catch {} setMuted(next); };
+
+  if (!videoId && !fileUrl) return null;
+
+  if (!videoId && fileUrl) {
+    return (
+      <div className="fixed inset-0 z-[90] bg-black flex items-center justify-center">
+        <video autoPlay muted playsInline src={fileUrl} className="w-full h-full object-cover" onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onEnded={onSkip} />
+        <div className="absolute inset-0" style={{ background: "rgba(0,0,0,0.35)" }} />
+        <div className="absolute inset-0 z-[5]" />
+        <button onClick={onClose} className="absolute top-4 right-4 z-20 w-10 h-10 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(0,0,0,0.6)", border: "1px solid rgba(255,255,255,0.2)", backdropFilter: "blur(8px)" }}><X className="w-5 h-5 text-white" /></button>
+        <div className="absolute top-4 left-4 z-20 flex items-center gap-2">
+          <div className="w-9 h-9 rounded-full overflow-hidden flex-shrink-0" style={{ boxShadow: "0 0 10px rgba(123,44,191,0.4)", border: "1.5px solid rgba(123,44,191,0.35)" }}><img src={LOGO_URL} alt="" className="w-full h-full object-cover" draggable={false} /></div>
+          <div className="leading-tight"><p className="text-white font-bold text-sm">آسمانک</p><p className="text-purple-300/70 text-[9px]">{series?.title}</p></div>
+        </div>
+        <div className="absolute bottom-0 left-0 right-0 z-20 px-4 pb-6 pt-20" style={{ background: "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.9) 50%)" }}>
+          <div className="mb-4"><span className="text-xs font-bold uppercase tracking-widest text-purple-400 mb-1 block">تریلر • Trailer</span><h2 className="text-white font-black text-xl md:text-2xl">{series?.title}</h2></div>
+          <div className="flex items-center justify-center gap-4">
+            <button onClick={() => { const v = document.querySelector('video'); if (v) { if (v.paused) v.play(); else v.pause(); } }} className="w-12 h-12 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", backdropFilter: "blur(8px)" }}>{isPlaying ? <Pause className="w-5 h-5 text-white" /> : <Play className="w-5 h-5 text-white" />}</button>
+            <button onClick={() => { const v = document.querySelector('video'); if (v) { v.muted = !v.muted; setMuted(v.muted); } }} className="w-10 h-10 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.15)", backdropFilter: "blur(8px)" }}>{muted ? <VolumeX className="w-4 h-4 text-white/70" /> : <Volume2 className="w-4 h-4 text-white" />}</button>
+            <button onClick={onSkip} className="flex items-center gap-2 px-5 py-2.5 rounded-lg transition-all hover:scale-105 active:scale-95" style={{ background: "transparent", border: "1.5px solid rgba(255,255,255,0.8)", boxShadow: "0 0 15px rgba(255,255,255,0.1)" }}><span className="text-white font-bold text-xs uppercase tracking-wider whitespace-nowrap">Skip Trailer</span><Play className="w-3.5 h-3.5 fill-white text-white" /></button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[90] bg-black flex items-center justify-center">
+      <div className="absolute inset-0 overflow-hidden">
+        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: "100vw", height: "56.25vw", minHeight: "100%", minWidth: "177.78vh", pointerEvents: "none" }}>
+          <div ref={containerRef} className="w-full h-full" />
+        </div>
+      </div>
+      <div className="absolute inset-0" style={{ background: "rgba(0,0,0,0.35)" }} />
+      <div className="absolute inset-0 z-[5]" />
+      <button onClick={onClose} className="absolute top-4 right-4 z-20 w-10 h-10 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(0,0,0,0.6)", border: "1px solid rgba(255,255,255,0.2)", backdropFilter: "blur(8px)" }}><X className="w-5 h-5 text-white" /></button>
+      <div className="absolute top-4 left-4 z-20 flex items-center gap-2">
+        <div className="w-9 h-9 rounded-full overflow-hidden flex-shrink-0" style={{ boxShadow: "0 0 10px rgba(123,44,191,0.4)", border: "1.5px solid rgba(123,44,191,0.35)" }}><img src={LOGO_URL} alt="" className="w-full h-full object-cover" draggable={false} /></div>
+        <div className="leading-tight"><p className="text-white font-bold text-sm">آسمانک</p><p className="text-purple-300/70 text-[9px]">{series?.title}</p></div>
+      </div>
+      {!ready && (<div className="absolute inset-0 flex items-center justify-center z-[15]"><div className="w-8 h-8 border-3 border-purple-500/30 border-t-purple-500 rounded-full animate-spin" /></div>)}
+      <div className="absolute bottom-0 left-0 right-0 z-20 px-4 pb-6 pt-20" style={{ background: "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.9) 50%)" }}>
+        <div className="mb-4"><span className="text-xs font-bold uppercase tracking-widest text-purple-400 mb-1 block">تریلر • Trailer</span><h2 className="text-white font-black text-xl md:text-2xl">{series?.title}</h2></div>
+        <div className="flex items-center justify-center gap-4">
+          <button onClick={togglePlay} className="w-12 h-12 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", backdropFilter: "blur(8px)" }}>{isPlaying ? <Pause className="w-5 h-5 text-white" /> : <Play className="w-5 h-5 text-white" />}</button>
+          <button onClick={toggleMute} className="w-10 h-10 rounded-full flex items-center justify-center transition-all hover:scale-110" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.15)", backdropFilter: "blur(8px)" }}>{muted ? <VolumeX className="w-4 h-4 text-white/70" /> : <Volume2 className="w-4 h-4 text-white" />}</button>
+          <button onClick={onSkip} className="flex items-center gap-2 px-5 py-2.5 rounded-lg transition-all hover:scale-105 active:scale-95" style={{ background: "transparent", border: "1.5px solid rgba(255,255,255,0.8)", boxShadow: "0 0 15px rgba(255,255,255,0.1)" }}><span className="text-white font-bold text-xs uppercase tracking-wider whitespace-nowrap">Skip Trailer</span><Play className="w-3.5 h-3.5 fill-white text-white" /></button>
+        </div>
+      </div>
+    </div>
+  );
+}
+─────────────────────────────────────────────────────────────────
+
+
+# ═══════════════════════════════════════════════════════════════
+# فایل‌های بزرگ‌تر (Media.jsx, SeriesDetail.jsx, SeriesCard.jsx,
+# YouTubePlayer.jsx, HlsVideoPlayer.jsx, HeroVideo.jsx, TrailerHero.jsx,
+# AddPlaylistForm.jsx) را مستقیماً از فایل‌های موجود در این برنامه
+# کپی کنید — این فایل‌ها بزرگ‌تر از ۲۰۰ خط هستند و محتوای کامل
+# آن‌ها در فایل‌های برنامه موجود است.
+#
+# پکیج‌های مورد‌نیاز: hls.js, @hello-pangea/dnd, lucide-react, framer-motion
+#
+# در App.jsx اضافه کنید:
+#    import Media from '@/pages/Media';
+#    <Route path="/Media" element={<Media />} />
+#
+# LOGO_URL را با لوگوی برنامه خود جایگزین کنید.
+# ═══════════════════════════════════════════════════════════════
